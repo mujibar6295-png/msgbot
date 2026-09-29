@@ -2,7 +2,7 @@ import os
 import json
 import logging
 import threading
-from datetime import datetime
+from datetime import datetime, time
 import pytz
 from flask import Flask
 
@@ -21,7 +21,6 @@ from telegram.ext import (
     ContextTypes,
     filters
 )
-from apscheduler.schedulers.background import BackgroundScheduler
 
 # ----------------- Configuration & Logging -----------------
 TOKEN = "8863781796:AAFTF6HVU5fD653V3lCgnJw2echi4iENRM0"
@@ -59,6 +58,7 @@ bot_db = load_data()
 flask_app = Flask(__name__)
 
 @flask_app.route('/')
+@flask_app.route('/healthz')
 def home():
     return "Bot is running perfectly!"
 
@@ -138,7 +138,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Menu Triggers
     if text == "➕ Add Channel":
-        # Native Telegram chat selector button requesting administrator rights
         btn = KeyboardButtonRequestChat(
             request_id=1,
             chat_is_channel=True,
@@ -290,7 +289,6 @@ def extract_flezen_link(caption_or_text: str) -> str:
     for word in words:
         if "flezen" in word.lower():
             return word
-    # Fallback to any http URL if 'flezen' is not directly matched
     for word in words:
         if word.startswith("http://") or word.startswith("https://"):
             return word
@@ -298,7 +296,6 @@ def extract_flezen_link(caption_or_text: str) -> str:
 
 async def handle_forwarded_content(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
-    # Process only forwarded content
     if not (msg.forward_origin or msg.forward_from_chat or msg.forward_from or msg.forward_date):
         return
 
@@ -335,7 +332,12 @@ async def handle_forwarded_content(update: Update, context: ContextTypes.DEFAULT
     )
 
 # ----------------- Dispatcher / Broadcast Execution -----------------
-async def dispatch_scheduled_batch(application):
+async def dispatch_scheduled_batch(context: ContextTypes.DEFAULT_TYPE):
+    # Check if the current time matches any scheduled time
+    now_str = datetime.now(TIMEZONE).strftime("%H:%M")
+    if now_str not in bot_db.get("scheduled_times", []):
+        return
+
     if not bot_db["queue"] or not bot_db["channels"]:
         return
 
@@ -358,37 +360,32 @@ async def dispatch_scheduled_batch(application):
         for chat_id in bot_db["channels"].keys():
             try:
                 if item["type"] == "photo":
-                    await application.bot.send_photo(
+                    await context.bot.send_photo(
                         chat_id=int(chat_id),
                         photo=item["file_id"],
                         caption=formatted_caption
                     )
                 elif item["type"] == "video":
-                    await application.bot.send_video(
+                    await context.bot.send_video(
                         chat_id=int(chat_id),
                         video=item["file_id"],
                         caption=formatted_caption
                     )
                 else:
-                    await application.bot.send_message(
+                    await context.bot.send_message(
                         chat_id=int(chat_id),
                         text=formatted_caption
                     )
             except Exception as e:
                 logging.error(f"Error sending to {chat_id}: {e}")
 
-def run_scheduler_check(application, loop):
-    now = datetime.now(TIMEZONE).strftime("%H:%M")
-    if now in bot_db.get("scheduled_times", []):
-        import asyncio
-        asyncio.run_coroutine_threadsafe(dispatch_scheduled_batch(application), loop)
-
 # ----------------- Main Bootstrapper -----------------
 def main():
-    # 1. Start Flask web server in a background thread for Render keep-alive
-    threading.Thread(target=run_flask, daemon=True).start()
+    # 1. Start Flask web server in a daemon thread for Render health-check
+    flask_thread = threading.Thread(target=run_flask, daemon=True)
+    flask_thread.start()
 
-    # 2. Build Telegram Application
+    # 2. Build Telegram Application with PTB JobQueue
     application = ApplicationBuilder().token(TOKEN).build()
 
     # Register Handlers
@@ -398,20 +395,13 @@ def main():
     application.add_handler(MessageHandler(filters.FORWARDED, handle_forwarded_content))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
-    # 3. Setup APScheduler for exact time polling (checks every minute)
-    import asyncio
-    loop = asyncio.get_event_loop()
-    scheduler = BackgroundScheduler(timezone=TIMEZONE)
-    scheduler.add_job(
-        run_scheduler_check,
-        trigger="cron",
-        second=0,
-        args=[application, loop]
-    )
-    scheduler.start()
+    # 3. Schedule the worker every 30 seconds using python-telegram-bot's native async JobQueue
+    job_queue = application.job_queue
+    if job_queue:
+        job_queue.run_repeating(dispatch_scheduled_batch, interval=30, first=5)
 
     # 4. Start polling
-    application.run_polling()
+    application.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()
