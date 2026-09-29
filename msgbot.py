@@ -9,17 +9,16 @@ from flask import Flask
 from telegram import (
     Update,
     ReplyKeyboardMarkup,
-    KeyboardButton,
-    KeyboardButtonRequestChat,
-    ChatAdministratorRights,
     InlineKeyboardButton,
-    InlineKeyboardMarkup
+    InlineKeyboardMarkup,
+    ChatMemberUpdated
 )
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
     MessageHandler,
     CallbackQueryHandler,
+    ChatMemberHandler,
     ContextTypes,
     filters
 )
@@ -34,7 +33,7 @@ logging.basicConfig(
     level=logging.INFO
 )
 
-# ----------------- Database / State Management -----------------
+# ----------------- Database / State -----------------
 def load_data():
     if os.path.exists(DATA_FILE):
         try:
@@ -62,7 +61,7 @@ flask_app = Flask(__name__)
 @flask_app.route('/')
 @flask_app.route('/healthz')
 def home():
-    return "Bot is running perfectly!"
+    return "Bot is running!"
 
 def run_flask():
     port = int(os.environ.get("PORT", 8080))
@@ -70,74 +69,54 @@ def run_flask():
 
 # ----------------- Keyboards -----------------
 def get_main_keyboard():
-    # Native Telegram Chat Selector with Admin Rights
-    admin_rights = ChatAdministratorRights(
-        is_anonymous=False,
-        can_manage_chat=True,
-        can_delete_messages=True,
-        can_manage_video_chats=False,
-        can_restrict_members=False,
-        can_promote_members=False,
-        can_change_info=False,
-        can_invite_users=True,
-        can_post_messages=True,
-        can_edit_messages=True,
-        can_pin_messages=True,
-        can_manage_topics=False
-    )
-
-    add_channel_btn = KeyboardButton(
-        text="➕ Add Channel",
-        request_chat=KeyboardButtonRequestChat(
-            request_id=1,
-            chat_is_channel=True,
-            user_administrator_rights=admin_rights,
-            bot_administrator_rights=admin_rights,
-            bot_is_member=True
-        )
-    )
-
     return ReplyKeyboardMarkup([
-        [add_channel_btn, KeyboardButton("⏰ Set Time")],
-        [KeyboardButton("🔢 Set Count"), KeyboardButton("🗑 Delete Channel")],
-        [KeyboardButton("📋 Queue"), KeyboardButton("❌ Delete Queue")],
-        [KeyboardButton("🔗 Add Backup Channel")]
+        ["➕ Add Channel", "⏰ Set Time"],
+        ["🔢 Set Count", "🗑 Delete Channel"],
+        ["📋 Queue", "❌ Delete Queue"],
+        ["🔗 Add Backup Channel"]
     ], resize_keyboard=True)
+
+# ----------------- Auto-Admin Tracker -----------------
+# Jokhon-i user bot-ke kono channel-e admin banabe, Telegram ei event trigger korbe
+async def handle_bot_promoted(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    result = update.my_chat_member
+    if not result:
+        return
+
+    chat = result.chat
+    new_status = result.new_chat_member.status
+
+    # Channel-e Bot promote hole auto-register
+    if chat.type == "channel" and new_status == "administrator":
+        chat_id = str(chat.id)
+        title = chat.title or f"Channel {chat_id}"
+        bot_db["channels"][chat_id] = title
+        save_data()
+
+        # Bot admin bananowar por channel owner/user-ke DM pathabe
+        try:
+            user_id = result.from_user.id
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=f"✅ **Channel Auto-Added!**\n\n"
+                     f"📢 **Channel:** {title}\n"
+                     f"🆔 **ID:** `{chat_id}`\n\n"
+                     f"Bot has been successfully linked and ready to post!",
+                parse_mode="Markdown",
+                reply_markup=get_main_keyboard()
+            )
+        except Exception:
+            pass
 
 # ----------------- Command & Message Handlers -----------------
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
-    await update.message.reply_text(
-        "👋 Welcome! Your Automated Channel Scheduler Bot is active.\n\n"
-        "👉 Click **➕ Add Channel** to pick from your admin channels.\n"
-        "Telegram will add the bot as admin and register it directly.",
-        reply_markup=get_main_keyboard(),
-        parse_mode="Markdown"
-    )
-
-# When user selects a channel from the native Telegram picker
-async def handle_chat_shared(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.clear()
-    chat_shared = update.message.chat_shared
-    if not chat_shared:
-        return
-
-    chat_id = str(chat_shared.chat_id)
-    try:
-        chat = await context.bot.get_chat(chat_id)
-        title = chat.title or f"Channel {chat_id}"
-    except Exception:
-        title = f"Channel {chat_id}"
-
-    bot_db["channels"][chat_id] = title
-    save_data()
+    bot_info = await context.bot.get_me()
+    context.bot_data["username"] = bot_info.username
 
     await update.message.reply_text(
-        f"✅ **Channel Added & Configured!**\n\n"
-        f"📢 **Channel Name:** {title}\n"
-        f"🆔 **Channel ID:** `{chat_id}`\n\n"
-        f"Bot is now an admin and added to your dispatch list.",
-        parse_mode="Markdown",
+        "👋 Welcome! Automated Channel Dispatcher is Online.\n"
+        "Click the buttons below to manage your channels and posts.",
         reply_markup=get_main_keyboard()
     )
 
@@ -145,8 +124,32 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     user_state = context.user_data.get("state")
 
-    # Menu Triggers
-    if text == "⏰ Set Time":
+    # Bot username fetch
+    bot_username = context.bot_data.get("username")
+    if not bot_username:
+        bot_info = await context.bot.get_me()
+        bot_username = bot_info.username
+        context.bot_data["username"] = bot_username
+
+    # 1. ➕ Add Channel - Instant One-Click Link
+    if text == "➕ Add Channel":
+        context.user_data.clear()
+        add_channel_url = f"https://t.me/{bot_username}?startchannel=botstart&admin=post_messages+edit_messages+delete_messages"
+        
+        inline_kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("➕ Choose Channel & Add as Admin", url=add_channel_url)]
+        ])
+        
+        await update.message.reply_text(
+            "👇 **Tap the button below** to see all the channels you own/manage.\n\n"
+            "Select your channel and confirm to add the bot as Admin. "
+            "Once added, the bot will automatically register the channel!",
+            reply_markup=inline_kb,
+            parse_mode="Markdown"
+        )
+        return
+
+    elif text == "⏰ Set Time":
         context.user_data.clear()
         await show_time_slots(update)
         return
@@ -162,7 +165,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif text == "🗑 Delete Channel":
         context.user_data.clear()
         if not bot_db["channels"]:
-            await update.message.reply_text("ℹ️ No channels have been added yet.")
+            await update.message.reply_text("ℹ️ No channels added yet.")
             return
 
         keyboard = []
@@ -171,7 +174,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 InlineKeyboardButton(f"🗑 {title}", callback_data=f"del_chan_{chat_id}")
             ])
         await update.message.reply_text(
-            "Select a channel below to remove it from the schedule:",
+            "Select a channel to remove:",
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
         return
@@ -201,26 +204,25 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["state"] = "awaiting_delete_queue"
         await update.message.reply_text(
             f"Current queue size: **{len(bot_db['queue'])}**\n"
-            "How many messages do you want to remove from the tail of the queue? Send the number:"
+            "How many messages do you want to delete from the end of the queue?"
         )
         return
 
     elif text == "🔗 Add Backup Channel":
         context.user_data["state"] = "awaiting_backup"
         await update.message.reply_text(
-            "Send the full link for your **NEW BACKUP CHANNEL** (e.g. `https://t.me/yourbackup`):"
+            "Send the full link for your **NEW BACKUP CHANNEL** (e.g. `https://t.me/yourchannel`):"
         )
         return
 
-    # Handle Input States
+    # Handle State Responses
     if user_state == "awaiting_count":
         if text.isdigit() and int(text) > 0:
             bot_db["send_count"] = int(text)
             save_data()
             context.user_data.clear()
             await update.message.reply_text(
-                f"✅ Send count set to: **{bot_db['send_count']}** messages per schedule.",
-                parse_mode="Markdown",
+                f"✅ Send count set to: **{bot_db['send_count']}**",
                 reply_markup=get_main_keyboard()
             )
         else:
@@ -247,18 +249,17 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 bot_db["queue"] = bot_db["queue"][:-del_count]
                 save_data()
                 await update.message.reply_text(
-                    f"✅ Successfully deleted last {del_count} message(s) from the queue.\n"
-                    f"Remaining in queue: {len(bot_db['queue'])}",
+                    f"✅ Deleted last {del_count} message(s).\nRemaining in queue: {len(bot_db['queue'])}",
                     reply_markup=get_main_keyboard()
                 )
             else:
-                await update.message.reply_text("Queue is already empty.", reply_markup=get_main_keyboard())
+                await update.message.reply_text("Queue is empty.", reply_markup=get_main_keyboard())
             context.user_data.clear()
         else:
             await update.message.reply_text("⚠️ Please send a valid number.")
         return
 
-# ----------------- Time Matrix (30 min gaps) -----------------
+# ----------------- Time Matrix -----------------
 async def show_time_slots(update: Update):
     keyboard = []
     current_selected = set(bot_db.get("scheduled_times", []))
@@ -279,7 +280,7 @@ async def show_time_slots(update: Update):
     elif update.callback_query:
         await update.callback_query.edit_message_reply_markup(reply_markup=reply_markup)
 
-# ----------------- Callback Query Handler -----------------
+# ----------------- Callbacks -----------------
 async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     data = query.data
@@ -307,7 +308,7 @@ async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         save_data()
         await query.edit_message_text(f"🗑 Channel removed: **{removed or chat_id}**", parse_mode="Markdown")
 
-# ----------------- Message Queue Listener -----------------
+# ----------------- Forward / Queue Listener -----------------
 def extract_flezen_link(caption_or_text: str) -> str:
     if not caption_or_text:
         return ""
@@ -342,8 +343,8 @@ async def handle_forwarded_content(update: Update, context: ContextTypes.DEFAULT
     save_data()
 
     await msg.reply_text(
-        f"📥 Message pushed directly to queue!\n"
-        f"Queue position: **#{len(bot_db['queue'])}**\n"
+        f"📥 Message added to queue!\n"
+        f"Position: **#{len(bot_db['queue'])}**\n"
         f"Detected Link: `{extracted_link or 'None'}`",
         parse_mode="Markdown"
     )
@@ -395,15 +396,15 @@ async def dispatch_scheduled_batch(context: ContextTypes.DEFAULT_TYPE):
             except Exception as e:
                 logging.error(f"Error sending to {chat_id}: {e}")
 
-# ----------------- Main Bootstrapper -----------------
+# ----------------- Main -----------------
 def main():
     threading.Thread(target=run_flask, daemon=True).start()
 
     application = ApplicationBuilder().token(TOKEN).build()
 
-    # Chat Shared Event Handler MUST come before general text handlers
+    # Handlers
     application.add_handler(CommandHandler("start", start_command))
-    application.add_handler(MessageHandler(filters.StatusUpdate.CHAT_SHARED, handle_chat_shared))
+    application.add_handler(ChatMemberHandler(handle_bot_promoted, ChatMemberHandler.MY_CHAT_MEMBER))
     application.add_handler(CallbackQueryHandler(handle_callbacks))
     application.add_handler(MessageHandler(filters.FORWARDED, handle_forwarded_content))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
