@@ -312,13 +312,22 @@ async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def extract_flezen_link(caption_or_text: str) -> str:
     if not caption_or_text:
         return ""
+    
     words = caption_or_text.split()
+    
+    # 1. First check if there is an explicit http/https URL anywhere in the text
     for word in words:
+        if word.startswith("http://") or word.startswith("https://") or "t.me/" in word:
+            return word
+            
+    # 2. If "flezen" exists, look for the next word which might be the link/identifier
+    for i, word in enumerate(words):
         if "flezen" in word.lower():
+            # Jodi flezen-er por kono word thake, ta return korbe
+            if i + 1 < len(words):
+                return words[i + 1]
             return word
-    for word in words:
-        if word.startswith("http://") or word.startswith("https://"):
-            return word
+            
     return ""
 
 async def handle_forwarded_content(update: Update, context: ContextTypes.DEFAULT_TYPE):
